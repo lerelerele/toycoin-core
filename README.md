@@ -1,4 +1,4 @@
-# Toycoin Core — Toynet128 v0.1.3
+# Toycoin Core — Toynet128 v0.2.0
 
 Toycoin Core is an educational Bitcoin-like blockchain for classrooms.
 
@@ -76,7 +76,7 @@ Student node:
 toycoind -toynet128 -addnode=http://seed1.example.org:28443
 ```
 
-This v0.1.3 gossips blocks and txs with a Bitcoin-style inventory relay
+This v0.2.0 gossips blocks and txs with a Bitcoin-style inventory relay
 (`inv`/`getdata`) over the JSON-RPC transport — new items propagate transitively
 and peers pull only what they lack (see [docs/Networking-Gossip.md](docs/Networking-Gossip.md)).
 It is not a raw TCP P2P protocol yet. Nodes follow the most-work chain and reorg

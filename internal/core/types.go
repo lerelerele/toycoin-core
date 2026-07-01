@@ -12,7 +12,7 @@ import (
 // Version is the single source of truth for the Toycoin Core release string.
 // Every user-facing surface (daemon log, CLI usage, getnetworkinfo) reads this
 // so the reported version can never drift between components again.
-const Version = "0.1.3"
+const Version = "0.2.0"
 
 const (
 	NetworkName            = "toynet128"
