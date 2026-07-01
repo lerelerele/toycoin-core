@@ -43,7 +43,7 @@ func main() {
 	mux.HandleFunc("/rpc", n.RPCHandler)
 	mux.HandleFunc("/explorer", n.RPCHandler)
 
-	log.Printf("[TOYCOIND] Toycoin Core v0.1.2 network=%s datadir=%s", core.NetworkName, n.DataDir)
+	log.Printf("[TOYCOIND] Toycoin Core v%s network=%s datadir=%s", core.Version, core.NetworkName, n.DataDir)
 	log.Printf("[TOYCOIND] auth=cookie file=%s (regenerated each startup)", filepath.Join(n.DataDir, core.CookieFile))
 	log.Printf("[TOYCOIND] dumpprivkey restricted to loopback connections")
 	log.Printf("[TOYCOIND] curve=toy128k1f pow=SHA256d rpc=http://%s/rpc", addr)

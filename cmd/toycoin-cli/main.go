@@ -63,7 +63,7 @@ func loadCookieAuth(datadir string) string {
 }
 
 func usage() {
-	fmt.Println(`Toycoin CLI v0.1.2
+	fmt.Println("Toycoin CLI v" + core.Version + `
 
 Examples:
   toycoin-cli getblockchaininfo

@@ -1,4 +1,4 @@
-# Toycoin Core — Toynet128 v0.1.2
+# Toycoin Core — Toynet128 v0.1.3
 
 Toycoin Core is an educational Bitcoin-like blockchain for classrooms.
 
@@ -76,7 +76,7 @@ Student node:
 toycoind -toynet128 -addnode=http://seed1.example.org:28443
 ```
 
-This v0.1.2 uses simple RPC peer sync, not a full Bitcoin P2P protocol yet.
+This v0.1.3 uses simple RPC peer sync, not a full Bitcoin P2P protocol yet.
 
 ## RPC security
 
@@ -121,7 +121,7 @@ toycoin-cli security walletreport
 
 ## Address format
 
-Toycoin v0.1.2 no longer uses the weak-looking `toy1` + Base58 construction.
+Toycoin no longer uses the weak-looking `toy1` + Base58 construction.
 
 New addresses use a Bech32-style native format:
 

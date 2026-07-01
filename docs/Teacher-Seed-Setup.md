@@ -1,6 +1,6 @@
 # Teacher seed node setup
 
-This v0.1.2 does not implement Bitcoin's full gossip protocol yet. It uses simple RPC peer sync so that students can share one Toynet128 chain through seed nodes.
+This v0.1.3 does not implement Bitcoin's full gossip protocol yet. It uses simple RPC peer sync so that students can share one Toynet128 chain through seed nodes.
 
 ## Seed server
 

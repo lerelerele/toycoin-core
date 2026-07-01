@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- Merkle root ---
@@ -176,7 +177,7 @@ func TestApplyBlockRollbackOnInvalidTx(t *testing.T) {
 		}
 	}
 
-	err = n.applyBlockLocked(b, true)
+	err = n.applyBlockLocked(b)
 	if err == nil {
 		t.Fatalf("applyBlockLocked should reject a block with an invalid tx")
 	}
@@ -185,6 +186,84 @@ func TestApplyBlockRollbackOnInvalidTx(t *testing.T) {
 	}
 	if n.Height() != heightBefore {
 		t.Fatalf("height changed after rejected block: was %d now %d", heightBefore, n.Height())
+	}
+}
+
+// --- Coinbase must not mint more than subsidy + fees (no inflation) ---
+
+// mineHeader solves PoW for a block in place, like the node's own mining loop.
+func mineHeader(b *Block) {
+	b.Header.MerkleRoot = MerkleRoot(b.Tx)
+	for nonce := uint64(0); ; nonce++ {
+		b.Header.Nonce = nonce
+		h := b.Header.Hash()
+		if MeetsTarget(h, b.Header.Bits) {
+			b.Hash = h
+			return
+		}
+	}
+}
+
+func TestCoinbaseInflationRejected(t *testing.T) {
+	n := newTestNode(t)
+	if _, err := n.CreateWallet("w"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := n.GetNewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tip := n.Tip()
+	// Empty mempool => allowed coinbase is exactly the subsidy. Pay one unit more.
+	cb := CoinbaseTx(a.Address, DefaultReward+1, tip.Header.Height+1, "greedy")
+	cb.TxID = cb.ComputeTxID()
+	b := Block{
+		Header: BlockHeader{Version: 1, PrevHash: tip.Hash, Time: time.Now().Unix(), Bits: DefaultBits, Height: tip.Header.Height + 1},
+		Tx:     []Transaction{cb},
+	}
+	mineHeader(&b)
+
+	heightBefore := n.Height()
+	if err := n.applyBlockLocked(b); err == nil {
+		t.Fatalf("block with over-valued coinbase must be rejected")
+	}
+	if n.Height() != heightBefore {
+		t.Fatalf("rejected inflationary block must not change height")
+	}
+
+	// A coinbase paying exactly the subsidy is accepted.
+	cb2 := CoinbaseTx(a.Address, DefaultReward, tip.Header.Height+1, "honest")
+	cb2.TxID = cb2.ComputeTxID()
+	b2 := Block{
+		Header: BlockHeader{Version: 1, PrevHash: tip.Hash, Time: time.Now().Unix(), Bits: DefaultBits, Height: tip.Header.Height + 1},
+		Tx:     []Transaction{cb2},
+	}
+	mineHeader(&b2)
+	if err := n.applyBlockLocked(b2); err != nil {
+		t.Fatalf("honest coinbase (subsidy only) must be accepted: %v", err)
+	}
+}
+
+func TestFutureTimestampRejected(t *testing.T) {
+	n := newTestNode(t)
+	if _, err := n.CreateWallet("w"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := n.GetNewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip := n.Tip()
+	cb := CoinbaseTx(a.Address, DefaultReward, tip.Header.Height+1, "future")
+	cb.TxID = cb.ComputeTxID()
+	b := Block{
+		Header: BlockHeader{Version: 1, PrevHash: tip.Hash, Time: time.Now().Unix() + MaxFutureBlockTime + 3600, Bits: DefaultBits, Height: tip.Header.Height + 1},
+		Tx:     []Transaction{cb},
+	}
+	mineHeader(&b)
+	if err := n.applyBlockLocked(b); err == nil {
+		t.Fatalf("block with far-future timestamp must be rejected")
 	}
 }
 

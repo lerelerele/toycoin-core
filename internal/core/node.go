@@ -356,7 +356,7 @@ func (n *Node) MineBlocks(count int, address string) ([]Block, error) {
 			}
 		}
 		n.mu.Lock()
-		if err := n.applyBlockLocked(b, true); err != nil {
+		if err := n.applyBlockLocked(b); err != nil {
 			n.mu.Unlock()
 			return mined, err
 		}
@@ -530,13 +530,20 @@ func (n *Node) validateTxLocked(tx Transaction, coinbaseAllowed bool) error {
 	return nil
 }
 
-func (n *Node) applyBlockLocked(b Block, fromLocalMining bool) error {
+func (n *Node) applyBlockLocked(b Block) error {
 	tip := n.Tip()
 	if b.Header.Height != tip.Header.Height+1 {
 		return fmt.Errorf("bad height: got %d want %d", b.Header.Height, tip.Header.Height+1)
 	}
 	if b.Header.PrevHash != tip.Hash {
 		return errors.New("bad prev hash")
+	}
+	// Reject blocks timestamped implausibly far in the future. There is
+	// intentionally no median-time-past check and no difficulty retarget here:
+	// this is an educational chain with a fixed target, and those consensus
+	// rules are left out on purpose to keep the code readable.
+	if b.Header.Time > time.Now().Unix()+MaxFutureBlockTime {
+		return errors.New("block timestamp too far in the future")
 	}
 	if b.Header.MerkleRoot != MerkleRoot(b.Tx) {
 		return errors.New("bad merkle root")
@@ -556,6 +563,10 @@ func (n *Node) applyBlockLocked(b Block, fromLocalMining bool) error {
 	working := cloneUTXO(n.State.UTXO)
 	old := n.State.UTXO
 	n.State.UTXO = working
+	// totalFees accumulates sum(inputs)-sum(outputs) across the block's
+	// non-coinbase txs, computed against the UTXO set as it exists at each tx
+	// (so a tx spending an earlier tx's output in the same block is handled).
+	var totalFees int64
 	for i, tx := range b.Tx {
 		if tx.TxID == "" {
 			tx.TxID = tx.ComputeTxID()
@@ -565,11 +576,20 @@ func (n *Node) applyBlockLocked(b Block, fromLocalMining bool) error {
 				n.State.UTXO = old
 				return errors.New("bad coinbase")
 			}
-		} else if err := n.validateTxLocked(tx, false); err != nil {
-			n.State.UTXO = old
-			return fmt.Errorf("tx %s invalid: %w", tx.TxID, err)
+		} else {
+			if tx.IsCoinbase() {
+				n.State.UTXO = old
+				return errors.New("only the first tx may be a coinbase")
+			}
+			if err := n.validateTxLocked(tx, false); err != nil {
+				n.State.UTXO = old
+				return fmt.Errorf("tx %s invalid: %w", tx.TxID, err)
+			}
 		}
 		if !tx.IsCoinbase() {
+			// txFeeLocked reads n.State.UTXO (== working) before we delete this
+			// tx's inputs below, so inSum is correct.
+			totalFees += n.txFeeLocked(tx)
 			for _, vin := range tx.Vin {
 				delete(n.State.UTXO, UTXOKey(vin.PrevTxID, vin.Vout))
 			}
@@ -579,6 +599,20 @@ func (n *Node) applyBlockLocked(b Block, fromLocalMining bool) error {
 				n.State.UTXO[UTXOKey(tx.TxID, vout)] = UTXO{TxID: tx.TxID, Vout: vout, Value: out.Value, Address: out.Address, Height: b.Header.Height, Coinbase: tx.IsCoinbase()}
 			}
 		}
+	}
+	// Enforce the emission rule: the coinbase may pay at most the block subsidy
+	// plus the fees actually collected from the block's transactions. Without
+	// this check a peer could submit a block whose coinbase mints coins out of
+	// thin air (unbounded inflation) — the exact failure Toycoin is meant to
+	// teach against.
+	var coinbaseOut int64
+	for _, out := range b.Tx[0].Vout {
+		coinbaseOut += out.Value
+	}
+	if coinbaseOut > DefaultReward+totalFees {
+		n.State.UTXO = old
+		return fmt.Errorf("coinbase pays %s but max allowed is %s (subsidy %s + fees %s)",
+			FormatAmount(coinbaseOut), FormatAmount(DefaultReward+totalFees), FormatAmount(DefaultReward), FormatAmount(totalFees))
 	}
 	n.State.Blocks = append(n.State.Blocks, b)
 	// Remove confirmed txs from mempool.
@@ -607,7 +641,7 @@ func cloneUTXO(m map[string]UTXO) map[string]UTXO {
 func (n *Node) SubmitBlock(b Block) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if err := n.applyBlockLocked(b, false); err != nil {
+	if err := n.applyBlockLocked(b); err != nil {
 		return err
 	}
 	return n.Save()
@@ -720,6 +754,11 @@ func (n *Node) SyncLoop(stop <-chan struct{}) {
 	}
 }
 
+// SyncOnce pulls newer blocks from each peer and appends them when they extend
+// the local tip. NOTE: this is deliberately a simple "follow a longer peer"
+// sync, not a full fork-choice engine — there is no reorg / most-work rule, so
+// two nodes that diverge at the same height stay split until one is reset. That
+// is an accepted limitation of this educational build (see docs/Roadmap.md).
 func (n *Node) SyncOnce() {
 	for _, peer := range n.Peers {
 		info, err := rpcCallMap(peer, "getblockchaininfo", []interface{}{})
@@ -911,7 +950,7 @@ func (n *Node) handleRPC(method string, params []json.RawMessage, loopback bool)
 			"require_auth":  !n.DisableAuth,
 		}, nil
 	case "getnetworkinfo":
-		return map[string]interface{}{"network": NetworkName, "version": "0.1.2", "p2p_port": DefaultP2PPort, "rpc_port": DefaultRPCPort, "peers": n.Peers, "address_format": "tn1q... Bech32 witness-v0"}, nil
+		return map[string]interface{}{"network": NetworkName, "version": Version, "p2p_port": DefaultP2PPort, "rpc_port": DefaultRPCPort, "peers": n.Peers, "address_format": "tn1q... Bech32 witness-v0"}, nil
 	case "getpeerinfo":
 		return n.Peers, nil
 	case "createwallet":

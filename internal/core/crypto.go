@@ -211,7 +211,7 @@ func AddressFromPublicKeyHex(pub string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Toynet128 address format v0.1.2:
+	// Toynet128 address format:
 	//   tn1 + Bech32 witness-v0 payload
 	//   HRP: "tn"
 	//   version: 0
@@ -272,57 +272,6 @@ func fixedBytes(x *big.Int, size int) []byte {
 	out := make([]byte, size)
 	copy(out[size-len(b):], b)
 	return out
-}
-
-func checksum(payload []byte) []byte {
-	a := sha256.Sum256(payload)
-	b := sha256.Sum256(a[:])
-	return b[:4]
-}
-
-// Minimal Base58Check helper, Bitcoin alphabet.
-const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-func Base58Encode(input []byte) string {
-	x := new(big.Int).SetBytes(input)
-	base := big.NewInt(58)
-	zero := big.NewInt(0)
-	mod := new(big.Int)
-	var out []byte
-	for x.Cmp(zero) > 0 {
-		x.DivMod(x, base, mod)
-		out = append(out, alphabet[mod.Int64()])
-	}
-	for _, b := range input {
-		if b == 0x00 {
-			out = append(out, alphabet[0])
-		} else {
-			break
-		}
-	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return string(out)
-}
-
-func Base58Decode(s string) []byte {
-	result := big.NewInt(0)
-	base := big.NewInt(58)
-	for _, r := range s {
-		idx := strings.IndexRune(alphabet, r)
-		if idx < 0 {
-			return nil
-		}
-		result.Mul(result, base)
-		result.Add(result, big.NewInt(int64(idx)))
-	}
-	decoded := result.Bytes()
-	zeros := 0
-	for zeros < len(s) && s[zeros] == alphabet[0] {
-		zeros++
-	}
-	return append(make([]byte, zeros), decoded...)
 }
 
 // Bech32 implementation for Toycoin native addresses. It follows BIP-173

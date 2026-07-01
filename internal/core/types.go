@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// Version is the single source of truth for the Toycoin Core release string.
+// Every user-facing surface (daemon log, CLI usage, getnetworkinfo) reads this
+// so the reported version can never drift between components again.
+const Version = "0.1.3"
+
 const (
 	NetworkName            = "toynet128"
 	Ticker                 = "TOY"
@@ -21,6 +26,11 @@ const (
 	DefaultBits            = 3 // leading hex zeroes. Keep low for classroom mining.
 	CoinbaseMaturity       = 2
 	DefaultFee             = int64(100000) // 0.001 TOY
+	// MaxFutureBlockTime bounds how far ahead of the node's clock a block
+	// timestamp may be. Bitcoin uses 2h; we keep the same generous tolerance so
+	// classroom nodes with mild clock skew on a LAN still accept each other's
+	// blocks, while blatantly bogus far-future timestamps are rejected.
+	MaxFutureBlockTime int64 = 2 * 60 * 60
 )
 
 type TxIn struct {

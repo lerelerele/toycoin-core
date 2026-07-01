@@ -1,8 +1,8 @@
-# Toycoin Address Format v0.1.2
+# Toycoin Address Format
 
 Toycoin v0.1 used a provisional `toy1` + Base58Check-looking address. That has been removed because it looked like an ad-hoc prefix, not a serious Bitcoin-like address format.
 
-Toycoin v0.1.2 uses a native Bech32 witness-v0 style address.
+Toycoin now uses a native Bech32 witness-v0 style address.
 
 ```text
 HRP: tn
@@ -21,4 +21,4 @@ Properties:
 - Bitcoin mainnet formats `1...`, `3...`, `bc1...` and WIF private keys are not accepted.
 - The format is educational and not compatible with Bitcoin.
 
-Migration note: v0.1 `toy1b...` addresses are obsolete. For a clean class chain, delete the old Toycoin data directory and restart Toynet128 with v0.1.2.
+Migration note: v0.1 `toy1b...` addresses are obsolete. For a clean class chain, delete the old Toycoin data directory and restart Toynet128 with the current build.
