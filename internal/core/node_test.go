@@ -439,3 +439,144 @@ func sha256sum(b []byte) []byte {
 	h := sha256.Sum256(b)
 	return h[:]
 }
+
+// --- paramInt: reject non-integer floats ---
+
+func TestParamIntRejectsFraction(t *testing.T) {
+	// 2.5 must NOT be silently truncated to 2.
+	v, err := paramInt([]json.RawMessage{json.RawMessage("2.5")}, 0)
+	if err == nil {
+		t.Fatalf("paramInt must reject 2.5, got %d", v)
+	}
+}
+
+func TestParamIntAcceptsInteger(t *testing.T) {
+	v, err := paramInt([]json.RawMessage{json.RawMessage("3")}, 0)
+	if err != nil {
+		t.Fatalf("paramInt(3): %v", err)
+	}
+	if v != 3 {
+		t.Fatalf("paramInt(3) = %d, want 3", v)
+	}
+}
+
+func TestParamIntAcceptsWholeNumberFloat(t *testing.T) {
+	// 2.0 is a whole number expressed as float; accept it as 2.
+	v, err := paramInt([]json.RawMessage{json.RawMessage("2.0")}, 0)
+	if err != nil {
+		t.Fatalf("paramInt(2.0): %v", err)
+	}
+	if v != 2 {
+		t.Fatalf("paramInt(2.0) = %d, want 2", v)
+	}
+}
+
+func TestParamIntMissing(t *testing.T) {
+	if _, err := paramInt(nil, 0); err == nil {
+		t.Fatalf("paramInt must error on missing parameter")
+	}
+}
+
+// --- RPC: POST-only and body size cap ---
+
+func TestRPCRejectsGET(t *testing.T) {
+	n := newTestNode(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", n.RPCHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/rpc", nil)
+	req.SetBasicAuth(n.rpcUser, n.rpcPass)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /rpc should be 405, got %d", rec.Code)
+	}
+}
+
+func TestRPCRejectsOversizedBody(t *testing.T) {
+	n := newTestNode(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", n.RPCHandler)
+
+	// Build a body larger than MaxRPCBodyBytes.
+	huge := make([]byte, MaxRPCBodyBytes+1024)
+	for i := range huge {
+		huge[i] = 'a'
+	}
+	body := append([]byte(`{"method":"getblockchaininfo","params":["`), huge...)
+	body = append(body, []byte(`"]}`)...)
+
+	req := httptest.NewRequest(http.MethodPost, "/rpc", bytes.NewReader(body))
+	req.SetBasicAuth(n.rpcUser, n.rpcPass)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	// The MaxBytesReader triggers an error during decode; the handler returns it
+	// via writeRPC as a JSON error. We just assert the request did NOT succeed
+	// (i.e. it is not a clean getblockchaininfo result).
+	var resp struct {
+		Error  string          `json:"error"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("could not parse response: %v body=%q", err, rec.Body.String())
+	}
+	if resp.Error == "" {
+		t.Fatalf("oversized body should produce an error, got result=%s", resp.Result)
+	}
+}
+
+// --- MineBlocks: stale block after a concurrent tip advance is skipped, not fatal ---
+
+// TestMineBlocksSkipsStaleBlock simulates the race: while MineBlocks is mining a
+// block, another caller advances the tip. The mined block becomes stale and
+// must be skipped (continue) rather than aborting mining with an error.
+//
+// We cannot easily interleave a tip advance inside MineBlocks' PoW loop from a
+// test, so we verify the invariant the skip logic relies on: a block whose
+// PrevHash no longer matches the current tip is rejected by applyBlockLocked.
+// MineBlocks' `if n.Tip().Hash != b.Header.PrevHash { continue }` guard uses the
+// same comparison before ever calling applyBlockLocked.
+func TestMineBlocksSkipsStaleBlock(t *testing.T) {
+	n := newTestNode(t)
+	if _, err := n.CreateWallet("w"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := n.GetNewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mine two blocks: height goes 0 -> 1 -> 2.
+	if _, err := n.MineBlocks(2, a.Address); err != nil {
+		t.Fatal(err)
+	}
+	if n.Height() != 2 {
+		t.Fatalf("expected height 2 after mining, got %d", n.Height())
+	}
+	heightBefore := n.Height()
+	stalePrevHash := n.State.Blocks[1].Hash // the block at height 1, NOT the tip
+
+	// Build a block that claims to follow height 1 (stalePrevHash) but with the
+	// height of the current tip + 1. This mimics a block mined on an old tip.
+	tip := n.Tip()
+	stale := Block{
+		Header: BlockHeader{
+			Version: 1, PrevHash: stalePrevHash,
+			Time: time.Now().Unix(), Bits: DefaultBits, Height: tip.Header.Height + 1,
+		},
+		Tx: []Transaction{CoinbaseTx(a.Address, DefaultReward, tip.Header.Height+1, "stale")},
+	}
+	stale.Tx[0].TxID = stale.Tx[0].ComputeTxID()
+	mineHeader(&stale)
+
+	if err := n.applyBlockLocked(stale); err == nil {
+		t.Fatalf("a stale-prev-hash block must be rejected by applyBlockLocked")
+	}
+	// The rejected block must not have changed the height.
+	if n.Height() != heightBefore {
+		t.Fatalf("stale block unexpectedly changed height: got %d want %d", n.Height(), heightBefore)
+	}
+}
+
+

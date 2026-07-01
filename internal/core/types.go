@@ -31,6 +31,11 @@ const (
 	// classroom nodes with mild clock skew on a LAN still accept each other's
 	// blocks, while blatantly bogus far-future timestamps are rejected.
 	MaxFutureBlockTime int64 = 2 * 60 * 60
+	// MaxRPCBodyBytes caps the size of a single JSON-RPC request body. Without a
+	// cap a client could stream an arbitrarily large body to exhaust memory. A
+	// single block with many txs is the largest legitimate payload; 4 MiB is far
+	// above what a classroom block needs while still bounding worst-case memory.
+	MaxRPCBodyBytes int64 = 4 * 1024 * 1024
 )
 
 type TxIn struct {
