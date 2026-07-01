@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -356,6 +357,16 @@ func (n *Node) MineBlocks(count int, address string) ([]Block, error) {
 			}
 		}
 		n.mu.Lock()
+		// While we held no lock during PoW, a block received via sync may have
+		// advanced the tip. Our mined block was built on the old prev hash, so
+		// it would now be rejected as "bad prev hash". Detect that case and just
+		// skip this mined block, continuing to the next iteration where we will
+		// rebuild on top of the new tip — instead of bailing out with an error
+		// that makes the caller think mining failed.
+		if n.Tip().Hash != b.Header.PrevHash {
+			n.mu.Unlock()
+			continue
+		}
 		if err := n.applyBlockLocked(b); err != nil {
 			n.mu.Unlock()
 			return mined, err
@@ -778,13 +789,21 @@ func (n *Node) SyncOnce() {
 			}
 			h, err := rpcCallString(peer, "getblockhash", []interface{}{local + 1})
 			if err != nil {
+				log.Printf("[NET] sync: %s getblockhash(%d) failed: %v", peer, local+1, err)
 				break
 			}
 			br, err := rpcCallBlock(peer, "getblock", []interface{}{h})
 			if err != nil {
+				log.Printf("[NET] sync: %s getblock(%s) failed: %v", peer, h, err)
 				break
 			}
 			if err := n.SubmitBlock(br); err != nil {
+				// "bad prev hash" here means the peer is on a different fork than
+				// we are: its block at local+1 does not extend our tip. There is
+				// no reorg support, so log the divergence loudly and stop trying
+				// this peer rather than looping forever. The operator (typically
+				// the teacher) needs to see this to reset the diverged node.
+				log.Printf("[NET] sync: %s block at height %d rejected (%v); likely chain divergence — this node may be on a different fork", peer, local+1, err)
 				break
 			}
 		}
@@ -867,12 +886,22 @@ func (n *Node) RPCHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// /rpc is a JSON-RPC endpoint; only POST is meaningful here. Rejecting GET
+	// etc. avoids logging spurious 405s from browsers/probes and makes the
+	// contract explicit.
+	if r.Method != http.MethodPost {
+		http.Error(w, "405 Method Not Allowed: /rpc requires POST", http.StatusMethodNotAllowed)
+		return
+	}
 	// /rpc requires authentication. /explorer and / stay public (read-only).
 	if !n.checkRPCAuth(r) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="toycoind"`)
 		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Cap the request body so a client cannot stream an arbitrarily large JSON
+	// blob to exhaust memory. The decoder will error past the limit.
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRPCBodyBytes)
 	var req struct {
 		Method string            `json:"method"`
 		Params []json.RawMessage `json:"params"`
@@ -892,7 +921,12 @@ func writeRPC(w http.ResponseWriter, result interface{}, err error) {
 		resp["error"] = err.Error()
 		resp["result"] = nil
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	// If encoding fails mid-write (e.g. a value that cannot be marshalled) the
+	// client would receive truncated JSON with no server-side signal. Log it so
+	// the operator can see the failure instead of it vanishing silently.
+	if encErr := json.NewEncoder(w).Encode(resp); encErr != nil {
+		log.Printf("[RPC] failed to encode response: %v", encErr)
+	}
 }
 
 func paramString(params []json.RawMessage, i int) (string, error) {
@@ -909,15 +943,22 @@ func paramInt(params []json.RawMessage, i int) (int, error) {
 	if len(params) <= i {
 		return 0, errors.New("missing parameter")
 	}
+	// A JSON integer unmarshals cleanly into int. If that fails, also accept a
+	// JSON number, but only if it has no fractional part — silently truncating
+	// 2.5 into 2 would be a surprising footgun for callers like
+	// generatetoaddress/getblockhash.
 	var n int
-	if err := json.Unmarshal(params[i], &n); err != nil {
-		var f float64
-		if e := json.Unmarshal(params[i], &f); e != nil {
-			return 0, err
-		}
-		n = int(f)
+	if err := json.Unmarshal(params[i], &n); err == nil {
+		return n, nil
 	}
-	return n, nil
+	var f float64
+	if err := json.Unmarshal(params[i], &f); err != nil {
+		return 0, fmt.Errorf("parameter %d must be an integer", i)
+	}
+	if f != float64(int64(f)) {
+		return 0, fmt.Errorf("parameter %d must be an integer, got %v", i, f)
+	}
+	return int(f), nil
 }
 func paramTx(params []json.RawMessage, i int) (Transaction, error) {
 	if len(params) <= i {
