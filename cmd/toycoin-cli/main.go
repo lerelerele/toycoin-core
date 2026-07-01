@@ -24,6 +24,15 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
+	// Some authority tooling runs entirely locally (offline key handling) and
+	// never touches the node RPC. Handle those before the RPC path.
+	if handled, err := runLocal(args); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	method, params, err := translate(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -40,6 +49,56 @@ func main() {
 	} else {
 		fmt.Println(string(result))
 	}
+}
+
+// runLocal handles subcommands that must run offline with the authority key and
+// never contact the node. Returns handled=true if it recognised the command.
+func runLocal(args []string) (bool, error) {
+	switch strings.ToLower(args[0]) {
+	case "genauthoritykey":
+		// Generate a fresh authority keypair. The private key must be kept
+		// offline; only the public key is handed to the nodes via -authoritypubkey.
+		d, err := core.RandomScalar()
+		if err != nil {
+			return true, err
+		}
+		P, err := core.PrivateToPublic(d)
+		if err != nil {
+			return true, err
+		}
+		pub, err := core.PublicKeyHex(P)
+		if err != nil {
+			return true, err
+		}
+		fmt.Println("authority private key (KEEP OFFLINE, do NOT put on a node):")
+		fmt.Println("  " + core.PrivateKeyHex(d))
+		fmt.Println("authority public key (give to nodes via -authoritypubkey):")
+		fmt.Println("  " + pub)
+		return true, nil
+	case "signcheckpoint":
+		// signcheckpoint <authority_priv_hex> <height> <blockhash>
+		if len(args) != 4 {
+			return true, fmt.Errorf("signcheckpoint requires <authority_priv_hex> <height> <blockhash>")
+		}
+		priv, err := core.ParsePrivateKeyHex(args[1])
+		if err != nil {
+			return true, err
+		}
+		height, err := strconv.Atoi(args[2])
+		if err != nil {
+			return true, err
+		}
+		cp, err := core.SignCheckpoint(priv, height, args[3])
+		if err != nil {
+			return true, err
+		}
+		out, _ := json.MarshalIndent(cp, "", "  ")
+		fmt.Println(string(out))
+		fmt.Println("\nSubmit it to a node with:")
+		fmt.Printf("  toycoin-cli submitcheckpoint %d %s %s %s\n", cp.Height, cp.BlockHash, cp.PubKey, cp.Signature)
+		return true, nil
+	}
+	return false, nil
 }
 
 // loadCookieAuth reads the node's .cookie file from the data directory and
@@ -74,7 +133,13 @@ Examples:
   toycoin-cli sendtoaddress tn1... 10
   toycoin-cli listunspent
   toycoin-cli security walletreport
-  toycoin-cli curveinfo`)
+  toycoin-cli curveinfo
+
+Authority / checkpoints:
+  toycoin-cli genauthoritykey                       (offline: make an authority keypair)
+  toycoin-cli signcheckpoint <priv> <height> <hash> (offline: sign a checkpoint)
+  toycoin-cli submitcheckpoint <height> <hash> <pubkey> <sig>
+  toycoin-cli getcheckpoint`)
 }
 
 func translate(args []string) (string, []interface{}, error) {
@@ -116,7 +181,18 @@ func translate(args []string) (string, []interface{}, error) {
 			return "", nil, fmt.Errorf("sendtoaddress requires address amount")
 		}
 		return cmd, []interface{}{args[1], args[2]}, nil
-	case "getblockchaininfo", "getnetworkinfo", "getpeerinfo", "getnewaddress", "getbalance", "listunspent", "getrawmempool", "getblockcount", "getbestblockhash", "curveinfo":
+	case "submitcheckpoint":
+		// submitcheckpoint <height> <blockhash> <pubkey> <signature>
+		if len(args) != 5 {
+			return "", nil, fmt.Errorf("submitcheckpoint requires <height> <blockhash> <pubkey> <signature>")
+		}
+		h, err := strconv.Atoi(args[1])
+		if err != nil {
+			return "", nil, err
+		}
+		cp := map[string]interface{}{"height": h, "block_hash": args[2], "pub_key": args[3], "signature": args[4]}
+		return "submitcheckpoint", []interface{}{cp}, nil
+	case "getblockchaininfo", "getnetworkinfo", "getpeerinfo", "getnewaddress", "getbalance", "listunspent", "getrawmempool", "getblockcount", "getbestblockhash", "curveinfo", "getcheckpoint":
 		return cmd, []interface{}{}, nil
 	default:
 		return "", nil, fmt.Errorf("unknown command %q", args[0])
