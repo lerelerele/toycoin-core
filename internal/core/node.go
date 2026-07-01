@@ -2,11 +2,15 @@ package core
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,12 +21,25 @@ import (
 	"time"
 )
 
+// CookieUser is the fixed username for cookie-file auth, like Bitcoin Core's
+// "__cookie__".
+const CookieUser = "__cookie__"
+
+// CookieFile is the name of the auth cookie written into the data directory.
+const CookieFile = ".cookie"
+
 type Node struct {
 	mu        sync.Mutex
 	State     *State
 	DataDir   string
 	StateFile string
 	Peers     []string
+	// RPC auth credentials. Filled by LoadNode; when DisableAuth is true the
+	// /rpc endpoint accepts unauthenticated requests (legacy/tests only).
+	rpcUser     string
+	rpcPass     string
+	cookiePath  string
+	DisableAuth bool
 }
 
 func DefaultDataDir() string {
@@ -68,10 +85,87 @@ func LoadNode(datadir string, peers []string) (*Node, error) {
 	}
 	st.Peers = mergePeers(st.Peers, peers)
 	n := &Node{State: st, DataDir: datadir, StateFile: stateFile, Peers: st.Peers}
+	if err := n.setupAuth(); err != nil {
+		return nil, err
+	}
 	if err := n.Save(); err != nil {
 		return nil, err
 	}
 	return n, nil
+}
+
+// setupAuth generates fresh cookie credentials for this run and writes them to
+// DataDir/.cookie (0600). The cookie is regenerated on every startup, so a
+// leaked old cookie is useless once the node restarts.
+func (n *Node) setupAuth() error {
+	n.cookiePath = filepath.Join(n.DataDir, CookieFile)
+	pass, err := randomCookieSecret()
+	if err != nil {
+		return err
+	}
+	n.rpcUser = CookieUser
+	n.rpcPass = pass
+	return writeCookie(n.cookiePath, n.rpcUser, n.rpcPass)
+}
+
+func writeCookie(path, user, pass string) error {
+	content := []byte(user + ":" + pass)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, content, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// randomCookieSecret returns a 32-byte hex-encoded secret (256 bits).
+func randomCookieSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// ReadCookieFile reads "user:pass" from the cookie file at the given path.
+// Returns an error if the file is missing or malformed.
+func ReadCookieFile(path string) (user, pass string, err error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(raw)), ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", errors.New("malformed cookie file")
+	}
+	return parts[0], parts[1], nil
+}
+
+// checkRPCAuth reports whether the request presents valid Basic credentials.
+// Always returns false when DisableAuth is false and credentials are absent or
+// wrong. Constant-time comparison is used for the password.
+func (n *Node) checkRPCAuth(r *http.Request) bool {
+	if n.DisableAuth {
+		return true
+	}
+	u, p, ok := r.BasicAuth()
+	if !ok || u != n.rpcUser {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(p), []byte(n.rpcPass)) == 1
+}
+
+// isLoopback reports whether the request originated from the local machine.
+// Used to restrict sensitive calls (dumpprivkey) to loopback regardless of auth.
+func isLoopback(remoteAddr string) bool {
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 func mergePeers(a, b []string) []string {
@@ -238,7 +332,13 @@ func (n *Node) MineBlocks(count int, address string) ([]Block, error) {
 	var mined []Block
 	for i := 0; i < count; i++ {
 		n.mu.Lock()
-		txs := []Transaction{CoinbaseTx(address, DefaultReward, n.Height()+1, "Toycoin Core coinbase")}
+		// Miner collects fees: the coinbase pays the block subsidy plus the
+		// total fees of the mempool txs included in this block, like Bitcoin.
+		var totalFees int64
+		for _, mtx := range n.State.Mempool {
+			totalFees += n.txFeeLocked(mtx)
+		}
+		txs := []Transaction{CoinbaseTx(address, DefaultReward+totalFees, n.Height()+1, "Toycoin Core coinbase")}
 		txs = append(txs, n.State.Mempool...)
 		prev := n.Tip()
 		b := Block{Header: BlockHeader{Version: 1, PrevHash: prev.Hash, Time: time.Now().Unix(), Bits: DefaultBits, Height: n.Height() + 1}, Tx: txs}
@@ -356,6 +456,26 @@ func (n *Node) CreateSendTx(to string, amount int64) (Transaction, error) {
 	}
 	go n.broadcastTx(tx)
 	return tx, nil
+}
+
+// txFeeLocked returns sum(inputs) - sum(outputs) for a non-coinbase tx.
+// It assumes the caller already holds n.mu (or is in applyBlockLocked context),
+// so it can read n.State.UTXO safely. Inputs referencing missing UTXOs are
+// treated as zero value (consistent with validateTxLocked rejecting them).
+func (n *Node) txFeeLocked(tx Transaction) int64 {
+	if tx.IsCoinbase() {
+		return 0
+	}
+	var inSum, outSum int64
+	for _, vin := range tx.Vin {
+		if u, ok := n.State.UTXO[UTXOKey(vin.PrevTxID, vin.Vout)]; ok {
+			inSum += u.Value
+		}
+	}
+	for _, vout := range tx.Vout {
+		outSum += vout.Value
+	}
+	return inSum - outSum
 }
 
 func (n *Node) validateTxLocked(tx Transaction, coinbaseAllowed bool) error {
@@ -708,6 +828,12 @@ func (n *Node) RPCHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// /rpc requires authentication. /explorer and / stay public (read-only).
+	if !n.checkRPCAuth(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="toycoind"`)
+		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	var req struct {
 		Method string            `json:"method"`
 		Params []json.RawMessage `json:"params"`
@@ -716,7 +842,7 @@ func (n *Node) RPCHandler(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, nil, err)
 		return
 	}
-	res, err := n.handleRPC(req.Method, req.Params)
+	res, err := n.handleRPC(req.Method, req.Params, isLoopback(r.RemoteAddr))
 	writeRPC(w, res, err)
 }
 
@@ -769,10 +895,21 @@ func paramBlock(params []json.RawMessage, i int) (Block, error) {
 	return b, json.Unmarshal(params[i], &b)
 }
 
-func (n *Node) handleRPC(method string, params []json.RawMessage) (interface{}, error) {
+func (n *Node) handleRPC(method string, params []json.RawMessage, loopback bool) (interface{}, error) {
 	switch strings.ToLower(method) {
 	case "getblockchaininfo":
 		return n.ChainInfo(), nil
+	case "getrpcinfo":
+		authMode := "cookie"
+		if n.DisableAuth {
+			authMode = "disabled"
+		}
+		return map[string]interface{}{
+			"auth_mode":     authMode,
+			"dumpprivkey":   "loopback-only",
+			"cookie_path":   n.cookiePath,
+			"require_auth":  !n.DisableAuth,
+		}, nil
 	case "getnetworkinfo":
 		return map[string]interface{}{"network": NetworkName, "version": "0.1.2", "p2p_port": DefaultP2PPort, "rpc_port": DefaultRPCPort, "peers": n.Peers, "address_format": "tn1q... Bech32 witness-v0"}, nil
 	case "getpeerinfo":
@@ -798,6 +935,12 @@ func (n *Node) handleRPC(method string, params []json.RawMessage) (interface{}, 
 	case "listunspent":
 		return n.ListUnspent()
 	case "dumpprivkey":
+		// dumpprivkey exports a private key, so it is restricted to loopback
+		// connections even when the caller is authenticated. This stops a
+		// remote peer with valid cookie creds from draining keys.
+		if !loopback {
+			return nil, errors.New("dumpprivkey only allowed from loopback (127.0.0.1/::1)")
+		}
 		addr, err := paramString(params, 0)
 		if err != nil {
 			return nil, err

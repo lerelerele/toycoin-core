@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 
 func main() {
 	rpcURL := flag.String("rpc", fmt.Sprintf("http://127.0.0.1:%d/rpc", core.DefaultRPCPort), "RPC endpoint")
+	datadir := flag.String("datadir", "", "data directory (to find the node .cookie for auth)")
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
@@ -27,7 +29,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	result, err := call(*rpcURL, method, params)
+	result, err := call(*rpcURL, method, params, *datadir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -38,6 +40,26 @@ func main() {
 	} else {
 		fmt.Println(string(result))
 	}
+}
+
+// loadCookieAuth reads the node's .cookie file from the data directory and
+// returns an Authorization header value. It returns "" if no cookie is found,
+// so the CLI keeps working against a legacy node that disabled auth.
+func loadCookieAuth(datadir string) string {
+	if datadir == "" {
+		datadir = core.DefaultDataDir()
+	}
+	cookiePath := filepath.Join(datadir, core.CookieFile)
+	user, pass, err := core.ReadCookieFile(cookiePath)
+	if err != nil {
+		return ""
+	}
+	req, err := http.NewRequest("GET", "/", nil)
+	if err != nil {
+		return ""
+	}
+	req.SetBasicAuth(user, pass)
+	return req.Header.Get("Authorization")
 }
 
 func usage() {
@@ -101,14 +123,26 @@ func translate(args []string) (string, []interface{}, error) {
 	}
 }
 
-func call(url, method string, params []interface{}) (json.RawMessage, error) {
+func call(url, method string, params []interface{}, datadir string) (json.RawMessage, error) {
 	body, _ := json.Marshal(map[string]interface{}{"method": method, "params": params})
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if auth := loadCookieAuth(datadir); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		hint := "the node requires cookie auth; make sure -datadir points at the node's data directory (contains .cookie)"
+		return nil, fmt.Errorf("401 Unauthorized: %s", hint)
+	}
 	var r struct {
 		Result json.RawMessage `json:"result"`
 		Error  string          `json:"error"`
@@ -117,7 +151,8 @@ func call(url, method string, params []interface{}) (json.RawMessage, error) {
 		return nil, fmt.Errorf("bad response: %w: %s", err, string(raw))
 	}
 	if r.Error != "" {
-		return nil, fmt.Errorf(r.Error)
+		// Use %s so an error message containing % is not treated as a format verb.
+		return nil, fmt.Errorf("%s", r.Error)
 	}
 	return r.Result, nil
 }

@@ -12,8 +12,9 @@ It is intentionally **not compatible with Bitcoin** and must never be used for r
 - UTXO model.
 - Native Toycoin addresses: real Bech32 witness-v0 format `tn1q...` with checksum.
 - Wallet creation and fresh change addresses.
-- PoW mining with SHA256d.
+- PoW mining with SHA256d; miners collect fees (coinbase = subsidy + fees).
 - Basic shared-chain sync through seed RPC peers.
+- Cookie-file RPC authentication (like Bitcoin Core); `dumpprivkey` restricted to loopback.
 - Security report for exposed public keys.
 
 ## Build
@@ -76,6 +77,31 @@ toycoind -toynet128 -addnode=http://seed1.example.org:28443
 ```
 
 This v0.1.2 uses simple RPC peer sync, not a full Bitcoin P2P protocol yet.
+
+## RPC security
+
+The `/rpc` endpoint is protected by **cookie-file authentication** (like Bitcoin
+Core). On every startup `toycoind` generates a random token and writes it to
+`<datadir>/.cookie` as `__cookie__:<token>` (mode 0600). `toycoin-cli` reads
+that file automatically and sends HTTP Basic Auth, so the CLI "just works"
+against a local node.
+
+- `/rpc` requires valid cookie credentials.
+- `/` and `/explorer` stay public (read-only chain state).
+- `dumpprivkey` is restricted to **loopback** connections (`127.0.0.1` / `::1`)
+  even with valid credentials, so a remote peer that somehow obtained the
+  cookie cannot export private keys.
+
+The cookie is regenerated on each restart, so a leaked old cookie becomes
+useless. Point the CLI at a non-default data dir with `-datadir=<path>` so it
+can find the cookie.
+
+> **Warning — no TLS.** The cookie protects against casual access and
+> share-the-network misuse, but it does **not** protect against an active
+> attacker on the wire (MITM) if you expose `toycoind` on the public internet
+> over plain HTTP. For a classroom on a trusted LAN this is the intended threat
+> model; do not expose a node with funds to the open internet without TLS or an
+> SSH tunnel.
 
 ## Basic commands
 
