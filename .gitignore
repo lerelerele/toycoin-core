@@ -1,0 +1,24 @@
+# Build output
+/dist/
+
+# Compiled binaries
+*.exe
+toycoind
+toycoin-cli
+
+# Stray/loose artifacts (binaries mistakenly renamed .txt, ad-hoc notes)
+*.bin.txt
+toycoin-cli.txt
+direccion.txt
+
+# Node runtime state (generated per node, may contain private keys)
+state.json
+state.json.tmp
+.cookie
+
+# Local toycoin data directories
+/.toycoin-data/
+/toycoin-data/
+
+# Go workspace cruft
+/vendor/
