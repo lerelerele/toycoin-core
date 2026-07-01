@@ -76,7 +76,18 @@ Student node:
 toycoind -toynet128 -addnode=http://seed1.example.org:28443
 ```
 
-This v0.1.3 uses simple RPC peer sync, not a full Bitcoin P2P protocol yet.
+This v0.1.3 gossips blocks and txs with a Bitcoin-style inventory relay
+(`inv`/`getdata`) over the JSON-RPC transport — new items propagate transitively
+and peers pull only what they lack (see [docs/Networking-Gossip.md](docs/Networking-Gossip.md)).
+It is not a raw TCP P2P protocol yet. Nodes follow the most-work chain and reorg
+automatically, so diverged nodes converge. On a trusted LAN that is enough; when exposing nodes further, an
+operator can pin the canonical chain with **authority checkpoints** (see
+[docs/Authority-Checkpoints.md](docs/Authority-Checkpoints.md)):
+
+```bash
+toycoin-cli genauthoritykey                 # once, offline
+toycoind -toynet128 -authoritypubkey <pub>  # on every node
+```
 
 ## RPC security
 
@@ -86,7 +97,12 @@ Core). On every startup `toycoind` generates a random token and writes it to
 that file automatically and sends HTTP Basic Auth, so the CLI "just works"
 against a local node.
 
-- `/rpc` requires valid cookie credentials.
+- Wallet and node-config RPC methods on `/rpc` require valid cookie credentials.
+- Read-only chain queries and fully-validated consensus pushes on `/rpc`
+  (`getblockchaininfo`, `getblock`, `submitblock`, `submittransaction`,
+  `submitcheckpoint`, …) are **public**, so peers can sync without sharing a
+  cookie. They expose the same data as `/explorer`, and pushed blocks/txs are
+  validated (and checkpoints signature-checked) before they can change state.
 - `/` and `/explorer` stay public (read-only chain state).
 - `dumpprivkey` is restricted to **loopback** connections (`127.0.0.1` / `::1`)
   even with valid credentials, so a remote peer that somehow obtained the

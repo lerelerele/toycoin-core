@@ -41,7 +41,20 @@ type Node struct {
 	rpcPass     string
 	cookiePath  string
 	DisableAuth bool
+	// AuthorityPubKey, when set, is the toy128k1f public key (04-prefixed hex)
+	// whose signed checkpoints this node trusts. Empty means checkpoints are
+	// disabled and fork choice is pure most-work. Set from -authoritypubkey.
+	AuthorityPubKey string
+	// SelfURL is this node's own reachable RPC base URL, advertised to peers so
+	// they can pull announced items (getblock/gettx). Empty means "not reachable
+	// for inbound pulls": the node then relays by pushing full data instead of
+	// announcing inventory. Set from -externaladdr.
+	SelfURL string
 }
+
+// MaxPeers caps how many peers a node will track, so peer-address learning from
+// gossip cannot grow the set without bound.
+const MaxPeers = 32
 
 func DefaultDataDir() string {
 	if runtime.GOOS == "windows" {
@@ -76,6 +89,15 @@ func LoadNode(datadir string, peers []string) (*Node, error) {
 		}
 		if st.Meta == nil {
 			st.Meta = map[string]interface{}{}
+		}
+		// Backfill the block index for states written before fork choice existed.
+		if st.Index == nil {
+			st.Index = map[string]Block{}
+		}
+		for _, b := range st.Blocks {
+			if _, ok := st.Index[b.Hash]; !ok {
+				st.Index[b.Hash] = b
+			}
 		}
 	} else {
 		var err error
@@ -169,16 +191,26 @@ func isLoopback(remoteAddr string) bool {
 	return ip.IsLoopback()
 }
 
+// normalizePeerURL trims a peer address and ensures it has an http(s) scheme.
+// Returns "" for empty input.
+func normalizePeerURL(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
+		p = "http://" + p
+	}
+	return p
+}
+
 func mergePeers(a, b []string) []string {
 	m := map[string]bool{}
 	var out []string
 	for _, p := range append(a, b...) {
-		p = strings.TrimSpace(p)
+		p = normalizePeerURL(p)
 		if p == "" {
 			continue
-		}
-		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
-			p = "http://" + p
 		}
 		if !m[p] {
 			m[p] = true
@@ -367,18 +399,19 @@ func (n *Node) MineBlocks(count int, address string) ([]Block, error) {
 			n.mu.Unlock()
 			continue
 		}
-		if err := n.applyBlockLocked(b); err != nil {
+		if err := n.acceptBlockLocked(b); err != nil {
 			n.mu.Unlock()
 			return mined, err
 		}
-		n.State.Mempool = []Transaction{}
+		// acceptBlockLocked already drops the mempool txs that this block
+		// confirmed; any tx that arrived during PoW and was not included stays.
 		if err := n.Save(); err != nil {
 			n.mu.Unlock()
 			return mined, err
 		}
 		n.mu.Unlock()
 		mined = append(mined, b)
-		go n.broadcastBlock(b)
+		go n.relayInv([]InvItem{{Type: InvBlock, Hash: b.Hash}}, "")
 	}
 	return mined, nil
 }
@@ -465,21 +498,20 @@ func (n *Node) CreateSendTx(to string, amount int64) (Transaction, error) {
 	if err := n.Save(); err != nil {
 		return Transaction{}, err
 	}
-	go n.broadcastTx(tx)
+	go n.relayInv([]InvItem{{Type: InvTx, Hash: tx.TxID}}, "")
 	return tx, nil
 }
 
-// txFeeLocked returns sum(inputs) - sum(outputs) for a non-coinbase tx.
-// It assumes the caller already holds n.mu (or is in applyBlockLocked context),
-// so it can read n.State.UTXO safely. Inputs referencing missing UTXOs are
-// treated as zero value (consistent with validateTxLocked rejecting them).
-func (n *Node) txFeeLocked(tx Transaction) int64 {
+// txFee returns sum(inputs) - sum(outputs) for a non-coinbase tx, evaluated
+// against the given UTXO set. Inputs referencing missing UTXOs are treated as
+// zero value (consistent with validateTx rejecting them).
+func txFee(tx Transaction, utxo map[string]UTXO) int64 {
 	if tx.IsCoinbase() {
 		return 0
 	}
 	var inSum, outSum int64
 	for _, vin := range tx.Vin {
-		if u, ok := n.State.UTXO[UTXOKey(vin.PrevTxID, vin.Vout)]; ok {
+		if u, ok := utxo[UTXOKey(vin.PrevTxID, vin.Vout)]; ok {
 			inSum += u.Value
 		}
 	}
@@ -489,7 +521,18 @@ func (n *Node) txFeeLocked(tx Transaction) int64 {
 	return inSum - outSum
 }
 
+// txFeeLocked evaluates txFee against the active-chain UTXO set. Caller holds n.mu.
+func (n *Node) txFeeLocked(tx Transaction) int64 { return txFee(tx, n.State.UTXO) }
+
+// validateTxLocked validates a tx against the active-chain UTXO set. Caller holds n.mu.
 func (n *Node) validateTxLocked(tx Transaction, coinbaseAllowed bool) error {
+	return validateTx(tx, n.State.UTXO, coinbaseAllowed)
+}
+
+// validateTx checks a transaction against the supplied UTXO set. It is a free
+// function (no node state) so it can validate txs on a candidate fork branch
+// during a reorg, not just on the active chain.
+func validateTx(tx Transaction, utxo map[string]UTXO, coinbaseAllowed bool) error {
 	if tx.IsCoinbase() {
 		if !coinbaseAllowed {
 			return errors.New("coinbase not allowed here")
@@ -505,7 +548,7 @@ func (n *Node) validateTxLocked(tx Transaction, coinbaseAllowed bool) error {
 			return errors.New("duplicate input")
 		}
 		seen[key] = true
-		u, ok := n.State.UTXO[key]
+		u, ok := utxo[key]
 		if !ok {
 			return fmt.Errorf("missing utxo %s", key)
 		}
@@ -541,12 +584,16 @@ func (n *Node) validateTxLocked(tx Transaction, coinbaseAllowed bool) error {
 	return nil
 }
 
-func (n *Node) applyBlockLocked(b Block) error {
-	tip := n.Tip()
-	if b.Header.Height != tip.Header.Height+1 {
-		return fmt.Errorf("bad height: got %d want %d", b.Header.Height, tip.Header.Height+1)
+// connectBlock validates block b as the child of prev and, if valid, applies it
+// to the given UTXO set (mutated in place). It has no access to node state, so
+// the same routine validates the active tip, a freshly mined block, and any
+// candidate fork branch replayed during a reorg. On error the utxo map may be
+// partially mutated, so callers must pass a throwaway copy.
+func connectBlock(b Block, prev Block, utxo map[string]UTXO) error {
+	if b.Header.Height != prev.Header.Height+1 {
+		return fmt.Errorf("bad height: got %d want %d", b.Header.Height, prev.Header.Height+1)
 	}
-	if b.Header.PrevHash != tip.Hash {
+	if b.Header.PrevHash != prev.Hash {
 		return errors.New("bad prev hash")
 	}
 	// Reject blocks timestamped implausibly far in the future. There is
@@ -571,9 +618,6 @@ func (n *Node) applyBlockLocked(b Block) error {
 	if len(b.Tx) == 0 || !b.Tx[0].IsCoinbase() {
 		return errors.New("first tx must be coinbase")
 	}
-	working := cloneUTXO(n.State.UTXO)
-	old := n.State.UTXO
-	n.State.UTXO = working
 	// totalFees accumulates sum(inputs)-sum(outputs) across the block's
 	// non-coinbase txs, computed against the UTXO set as it exists at each tx
 	// (so a tx spending an earlier tx's output in the same block is handled).
@@ -584,30 +628,27 @@ func (n *Node) applyBlockLocked(b Block) error {
 		}
 		if i == 0 {
 			if !tx.IsCoinbase() {
-				n.State.UTXO = old
 				return errors.New("bad coinbase")
 			}
 		} else {
 			if tx.IsCoinbase() {
-				n.State.UTXO = old
 				return errors.New("only the first tx may be a coinbase")
 			}
-			if err := n.validateTxLocked(tx, false); err != nil {
-				n.State.UTXO = old
+			if err := validateTx(tx, utxo, false); err != nil {
 				return fmt.Errorf("tx %s invalid: %w", tx.TxID, err)
 			}
 		}
 		if !tx.IsCoinbase() {
-			// txFeeLocked reads n.State.UTXO (== working) before we delete this
-			// tx's inputs below, so inSum is correct.
-			totalFees += n.txFeeLocked(tx)
+			// txFee reads utxo before we delete this tx's inputs below, so inSum
+			// is correct even for a tx spending an earlier tx in the same block.
+			totalFees += txFee(tx, utxo)
 			for _, vin := range tx.Vin {
-				delete(n.State.UTXO, UTXOKey(vin.PrevTxID, vin.Vout))
+				delete(utxo, UTXOKey(vin.PrevTxID, vin.Vout))
 			}
 		}
 		for vout, out := range tx.Vout {
 			if out.Value > 0 && VerifyAddress(out.Address) {
-				n.State.UTXO[UTXOKey(tx.TxID, vout)] = UTXO{TxID: tx.TxID, Vout: vout, Value: out.Value, Address: out.Address, Height: b.Header.Height, Coinbase: tx.IsCoinbase()}
+				utxo[UTXOKey(tx.TxID, vout)] = UTXO{TxID: tx.TxID, Vout: vout, Value: out.Value, Address: out.Address, Height: b.Header.Height, Coinbase: tx.IsCoinbase()}
 			}
 		}
 	}
@@ -621,14 +662,201 @@ func (n *Node) applyBlockLocked(b Block) error {
 		coinbaseOut += out.Value
 	}
 	if coinbaseOut > DefaultReward+totalFees {
-		n.State.UTXO = old
 		return fmt.Errorf("coinbase pays %s but max allowed is %s (subsidy %s + fees %s)",
 			FormatAmount(coinbaseOut), FormatAmount(DefaultReward+totalFees), FormatAmount(DefaultReward), FormatAmount(totalFees))
 	}
-	n.State.Blocks = append(n.State.Blocks, b)
-	// Remove confirmed txs from mempool.
+	return nil
+}
+
+// acceptBlockLocked is the single entry point for every block, whether mined
+// locally or received from a peer. It validates the block's proof of work and
+// self-consistency, records it in the block index, and then either extends the
+// active chain directly (fast path) or, if the block belongs to a side branch,
+// runs fork choice to switch onto the most-work chain. Caller holds n.mu.
+func (n *Node) acceptBlockLocked(b Block) error {
+	if b.Hash == "" {
+		b.Hash = b.Header.Hash()
+	}
+	if b.Header.Hash() != b.Hash {
+		return errors.New("bad block hash")
+	}
+	if !MeetsTarget(b.Hash, b.Header.Bits) {
+		return errors.New("proof of work target not met")
+	}
+	// Populate txids so the stored block, its merkle root and getblock all agree.
+	for i := range b.Tx {
+		if b.Tx[i].TxID == "" {
+			b.Tx[i].TxID = b.Tx[i].ComputeTxID()
+		}
+	}
+	if len(b.Tx) == 0 || !b.Tx[0].IsCoinbase() {
+		return errors.New("first tx must be coinbase")
+	}
+	if b.Header.MerkleRoot != MerkleRoot(b.Tx) {
+		return errors.New("bad merkle root")
+	}
+	if _, known := n.State.Index[b.Hash]; known {
+		return nil // already have it; accepting again is a no-op
+	}
+
+	tip := n.Tip()
+	// Fast path only when the block extends the active tip AND that active chain
+	// already honors any checkpoint (so appending cannot bless a forbidden
+	// branch). If the active chain is currently in violation — e.g. a checkpoint
+	// just arrived for a branch we have not synced yet — fall through to reorg,
+	// which only ever adopts checkpoint-honoring chains.
+	if b.Header.PrevHash == tip.Hash && b.Header.Height == tip.Header.Height+1 && n.chainHonorsCheckpointLocked(n.State.Blocks) {
+		// Validate against a copy of the UTXO set so a failure leaves state
+		// untouched, then commit.
+		working := cloneUTXO(n.State.UTXO)
+		if err := connectBlock(b, tip, working); err != nil {
+			return err
+		}
+		n.State.UTXO = working
+		n.State.Blocks = append(n.State.Blocks, b)
+		n.State.Index[b.Hash] = b
+		n.removeConfirmedFromMempoolLocked(b.Tx)
+		return nil
+	}
+
+	// The block does not extend the active tip: it is a fork or an orphan whose
+	// parent we may already have. Store it and let fork choice decide whether the
+	// branch it belongs to now outweighs the active chain.
+	n.State.Index[b.Hash] = b
+	n.reorgToBestLocked()
+	return nil
+}
+
+// chainHonorsCheckpointLocked reports whether a genesis-first chain contains the
+// currently accepted checkpoint's block at the checkpoint height. With no
+// checkpoint set, every chain honors it.
+func (n *Node) chainHonorsCheckpointLocked(chain []Block) bool {
+	cp := n.State.Checkpoint
+	if cp == nil {
+		return true
+	}
+	if cp.Height < 0 || cp.Height >= len(chain) {
+		return false // chain does not even reach the checkpoint height
+	}
+	return chain[cp.Height].Hash == cp.BlockHash
+}
+
+// reorgToBestLocked scans the block index for the valid, checkpoint-honoring
+// chain with the most cumulative work and makes it active, rebuilding the UTXO
+// set and mempool. A checkpoint acts as a veto: chains that do not contain the
+// checkpointed block are never adopted, no matter how much work they carry.
+//
+// Ties keep the incumbent chain, so the node does not flap between equal
+// branches. The one exception is when the active chain itself violates a
+// (newly arrived) checkpoint: then any honoring chain is preferable, even a
+// lighter one, so the node leaves the forbidden branch as soon as it can.
+func (n *Node) reorgToBestLocked() {
+	activeHonors := n.chainHonorsCheckpointLocked(n.State.Blocks)
+	var bestChain []Block
+	var bestUTXO map[string]UTXO
+	bestWork := big.NewInt(-1)
+	if activeHonors {
+		bestChain = n.State.Blocks
+		bestWork = chainWork(n.State.Blocks)
+		// bestUTXO stays nil: "keep the current active chain unless beaten".
+	}
+	for hash := range n.State.Index {
+		chain, ok := n.buildChainLocked(hash)
+		if !ok {
+			continue
+		}
+		if !n.chainHonorsCheckpointLocked(chain) {
+			continue // vetoed by the checkpoint
+		}
+		w := chainWork(chain)
+		if w.Cmp(bestWork) <= 0 {
+			continue
+		}
+		utxo, err := replayChain(chain)
+		if err != nil {
+			continue // this branch contains an invalid block; ignore it
+		}
+		bestChain, bestWork, bestUTXO = chain, w, utxo
+	}
+	if bestUTXO == nil {
+		if !activeHonors {
+			cp := n.State.Checkpoint
+			log.Printf("[CHECKPOINT] active chain violates checkpoint (height=%d hash=%s) and no honoring chain is known yet; waiting for sync", cp.Height, cp.BlockHash)
+		}
+		return // nothing better (or nothing honoring) to switch to
+	}
+	oldChain := n.State.Blocks
+	n.State.Blocks = bestChain
+	n.State.UTXO = bestUTXO
+	n.rebuildMempoolAfterReorgLocked(oldChain, bestChain)
+	newTip := bestChain[len(bestChain)-1]
+	log.Printf("[REORG] active chain switched to tip=%s height=%d (old height=%d)", newTip.Hash, newTip.Header.Height, oldChain[len(oldChain)-1].Header.Height)
+}
+
+// buildChainLocked reconstructs the chain from genesis up to the block `hash`
+// by following prev-hash links through the index. It returns false if any
+// ancestor is missing or the branch does not anchor to our genesis block.
+func (n *Node) buildChainLocked(hash string) ([]Block, bool) {
+	genesisHash := n.State.Blocks[0].Hash
+	var rev []Block
+	h := hash
+	for i := 0; i <= len(n.State.Index); i++ {
+		b, ok := n.State.Index[h]
+		if !ok {
+			return nil, false
+		}
+		rev = append(rev, b)
+		if b.Hash == genesisHash {
+			chain := make([]Block, len(rev))
+			for j, blk := range rev {
+				chain[len(rev)-1-j] = blk
+			}
+			return chain, true
+		}
+		if b.Header.Height == 0 {
+			return nil, false // a height-0 block that is not our genesis: foreign chain
+		}
+		h = b.Header.PrevHash
+	}
+	return nil, false // chain longer than the index: a cycle, reject it
+}
+
+// replayChain validates a full chain (genesis first) into a fresh UTXO set.
+// Genesis itself carries no spendable output, so application starts at height 1.
+func replayChain(chain []Block) (map[string]UTXO, error) {
+	utxo := map[string]UTXO{}
+	for i := 1; i < len(chain); i++ {
+		if err := connectBlock(chain[i], chain[i-1], utxo); err != nil {
+			return nil, err
+		}
+	}
+	return utxo, nil
+}
+
+// blockWork is the expected work of a block at the given difficulty. Each
+// required leading hex zero multiplies the search space by 16, so work = 16^bits.
+func blockWork(bits int) *big.Int {
+	if bits < 0 {
+		bits = 0
+	}
+	return new(big.Int).Lsh(big.NewInt(1), uint(4*bits)) // 2^(4*bits) == 16^bits
+}
+
+// chainWork sums the per-block work over a chain. With a fixed target this is
+// equivalent to counting blocks, but summing work keeps fork choice correct if
+// the difficulty ever varies.
+func chainWork(chain []Block) *big.Int {
+	sum := new(big.Int)
+	for _, b := range chain {
+		sum.Add(sum, blockWork(b.Header.Bits))
+	}
+	return sum
+}
+
+// removeConfirmedFromMempoolLocked drops any mempool tx now confirmed in a block.
+func (n *Node) removeConfirmedFromMempoolLocked(txs []Transaction) {
 	confirmed := map[string]bool{}
-	for _, tx := range b.Tx {
+	for _, tx := range txs {
 		confirmed[tx.TxID] = true
 	}
 	var mp []Transaction
@@ -638,7 +866,56 @@ func (n *Node) applyBlockLocked(b Block) error {
 		}
 	}
 	n.State.Mempool = mp
-	return nil
+}
+
+// rebuildMempoolAfterReorgLocked recomputes the mempool after switching chains.
+// Non-coinbase txs from blocks that were disconnected (on the old chain but not
+// the new one) are returned to the mempool, together with the txs already there,
+// minus anything now confirmed on the new chain or no longer valid against the
+// new UTXO set. n.State.UTXO must already point at the new chain's UTXO set.
+func (n *Node) rebuildMempoolAfterReorgLocked(oldChain, newChain []Block) {
+	confirmed := map[string]bool{}
+	newHashes := map[string]bool{}
+	for _, b := range newChain {
+		newHashes[b.Hash] = true
+		for _, tx := range b.Tx {
+			confirmed[tx.TxID] = true
+		}
+	}
+	candidates := append([]Transaction{}, n.State.Mempool...)
+	for _, b := range oldChain {
+		if newHashes[b.Hash] {
+			continue // block survived the reorg; its txs stay confirmed
+		}
+		for _, tx := range b.Tx {
+			if tx.IsCoinbase() {
+				continue // a disconnected coinbase cannot re-enter the mempool
+			}
+			candidates = append(candidates, tx)
+		}
+	}
+	var mp []Transaction
+	seen := map[string]bool{}
+	for _, tx := range candidates {
+		if tx.TxID == "" {
+			tx.TxID = tx.ComputeTxID()
+		}
+		if confirmed[tx.TxID] || seen[tx.TxID] {
+			continue
+		}
+		if validateTx(tx, n.State.UTXO, false) != nil {
+			continue // spent by the winning branch or otherwise no longer valid
+		}
+		seen[tx.TxID] = true
+		mp = append(mp, tx)
+	}
+	n.State.Mempool = mp
+}
+
+// hasBlockLocked reports whether a block with the given hash is in the index.
+func (n *Node) hasBlockLocked(hash string) bool {
+	_, ok := n.State.Index[hash]
+	return ok
 }
 
 func cloneUTXO(m map[string]UTXO) map[string]UTXO {
@@ -651,29 +928,75 @@ func cloneUTXO(m map[string]UTXO) map[string]UTXO {
 
 func (n *Node) SubmitBlock(b Block) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.applyBlockLocked(b); err != nil {
+	if b.Hash == "" {
+		b.Hash = b.Header.Hash()
+	}
+	wasNew := !n.hasBlockLocked(b.Hash)
+	err := n.acceptBlockLocked(b)
+	if err == nil {
+		err = n.Save()
+	}
+	n.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	return n.Save()
+	// Relay a genuinely new block onward for transitive gossip. A peer that
+	// already has it will not re-relay, so the flood terminates.
+	if wasNew {
+		go n.relayInv([]InvItem{{Type: InvBlock, Hash: b.Hash}}, "")
+	}
+	return nil
+}
+
+// SubmitCheckpoint validates an authority-signed checkpoint and, if it is newer
+// than the one we hold, records it and re-runs fork choice. A checkpoint can
+// force the node off a branch the authority did not bless.
+func (n *Node) SubmitCheckpoint(cp Checkpoint) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.AuthorityPubKey == "" {
+		return errors.New("this node has no authority key configured; checkpoints are disabled")
+	}
+	if err := VerifyCheckpoint(cp, n.AuthorityPubKey); err != nil {
+		return err
+	}
+	if n.State.Checkpoint != nil && cp.Height <= n.State.Checkpoint.Height {
+		return nil // never downgrade; also stops rebroadcast loops (no push below)
+	}
+	n.State.Checkpoint = &cp
+	n.reorgToBestLocked()
+	if err := n.Save(); err != nil {
+		return err
+	}
+	// Relay only genuinely-new checkpoints onward. Peers that already hold this
+	// height short-circuit above and do not re-broadcast, so the flood stops.
+	go n.broadcastCheckpoint(cp)
+	return nil
 }
 
 func (n *Node) SubmitTx(tx Transaction) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if tx.TxID == "" {
 		tx.TxID = tx.ComputeTxID()
 	}
 	for _, t := range n.State.Mempool {
 		if t.TxID == tx.TxID {
-			return nil
+			n.mu.Unlock()
+			return nil // already have it: do not re-relay (stops gossip loops)
 		}
 	}
 	if err := n.validateTxLocked(tx, false); err != nil {
+		n.mu.Unlock()
 		return err
 	}
 	n.State.Mempool = append(n.State.Mempool, tx)
-	return n.Save()
+	err := n.Save()
+	n.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	go n.relayInv([]InvItem{{Type: InvTx, Hash: tx.TxID}}, "")
+	return nil
 }
 
 func (n *Node) WalletReport() map[string]interface{} {
@@ -718,10 +1041,18 @@ func (n *Node) ChainInfo() map[string]interface{} {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	tip := n.Tip()
+	checkpointHeight := -1
+	if n.State.Checkpoint != nil {
+		checkpointHeight = n.State.Checkpoint.Height
+	}
 	return map[string]interface{}{
 		"chain":                              NetworkName,
 		"blocks":                             n.Height(),
 		"bestblockhash":                      tip.Hash,
+		"chainwork":                          chainWork(n.State.Blocks).String(),
+		"known_blocks":                       len(n.State.Index),
+		"authority_configured":               n.AuthorityPubKey != "",
+		"checkpoint_height":                  checkpointHeight,
 		"difficulty_bits_leading_hex_zeroes": tip.Header.Bits,
 		"mempool_tx":                         len(n.State.Mempool),
 		"utxo_count":                         len(n.State.UTXO),
@@ -744,10 +1075,10 @@ func (n *Node) GetBlockHash(height int) (string, error) {
 func (n *Node) GetBlock(hash string) (Block, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for _, b := range n.State.Blocks {
-		if b.Hash == hash {
-			return b, nil
-		}
+	// Serve from the full index so peers can pull side-branch blocks announced
+	// via inv, not only blocks currently on the active chain.
+	if b, ok := n.State.Index[hash]; ok {
+		return b, nil
 	}
 	return Block{}, errors.New("block not found")
 }
@@ -765,59 +1096,86 @@ func (n *Node) SyncLoop(stop <-chan struct{}) {
 	}
 }
 
-// SyncOnce pulls newer blocks from each peer and appends them when they extend
-// the local tip. NOTE: this is deliberately a simple "follow a longer peer"
-// sync, not a full fork-choice engine — there is no reorg / most-work rule, so
-// two nodes that diverge at the same height stay split until one is reset. That
-// is an accepted limitation of this educational build (see docs/Roadmap.md).
+// SyncOnce pulls the best chain and the latest checkpoint from each peer.
 func (n *Node) SyncOnce() {
 	for _, peer := range n.Peers {
-		info, err := rpcCallMap(peer, "getblockchaininfo", []interface{}{})
-		if err != nil {
-			continue
-		}
-		remoteBlocks, ok := asInt(info["blocks"])
-		if !ok {
-			continue
-		}
-		for {
-			n.mu.Lock()
-			local := n.Height()
-			n.mu.Unlock()
-			if local >= remoteBlocks {
-				break
-			}
-			h, err := rpcCallString(peer, "getblockhash", []interface{}{local + 1})
-			if err != nil {
-				log.Printf("[NET] sync: %s getblockhash(%d) failed: %v", peer, local+1, err)
-				break
-			}
-			br, err := rpcCallBlock(peer, "getblock", []interface{}{h})
-			if err != nil {
-				log.Printf("[NET] sync: %s getblock(%s) failed: %v", peer, h, err)
-				break
-			}
-			if err := n.SubmitBlock(br); err != nil {
-				// "bad prev hash" here means the peer is on a different fork than
-				// we are: its block at local+1 does not extend our tip. There is
-				// no reorg support, so log the divergence loudly and stop trying
-				// this peer rather than looping forever. The operator (typically
-				// the teacher) needs to see this to reset the diverged node.
-				log.Printf("[NET] sync: %s block at height %d rejected (%v); likely chain divergence — this node may be on a different fork", peer, local+1, err)
-				break
-			}
+		n.syncBlocksFromPeer(peer)
+		// Always pull the peer's checkpoint, even when our blocks are already up
+		// to date: the authority may have blessed a new tip we must enforce.
+		// SubmitCheckpoint no-ops if we have no authority key or it is not newer.
+		if cp, ok := rpcGetCheckpoint(peer); ok {
+			_ = n.SubmitCheckpoint(cp)
 		}
 	}
 }
 
-func (n *Node) broadcastTx(tx Transaction) {
-	for _, p := range n.Peers {
-		_, _ = rpcPost(p, "submittransaction", []interface{}{tx})
+// syncBlocksFromPeer walks the peer's chain backward from its best block until
+// it reaches a block we already have (the fork point) or genesis, then applies
+// those blocks oldest-first. acceptBlockLocked runs fork choice, so if the
+// peer's branch carries more work than ours the node reorgs onto it. This makes
+// two diverged nodes converge on the heavier chain instead of staying split.
+func (n *Node) syncBlocksFromPeer(peer string) {
+	info, err := rpcCallMap(peer, "getblockchaininfo", []interface{}{})
+	if err != nil {
+		return
+	}
+	remoteHeight, ok := asInt(info["blocks"])
+	if !ok {
+		return
+	}
+	remoteTip, _ := info["bestblockhash"].(string)
+	if remoteTip == "" {
+		return
+	}
+	n.mu.Lock()
+	local := n.Height()
+	haveTip := n.hasBlockLocked(remoteTip)
+	n.mu.Unlock()
+	// With a fixed target, more work == more blocks, so a peer no taller than
+	// us can never win fork choice; skip it. Also skip if we already have its
+	// tip (nothing new to fetch).
+	if haveTip || remoteHeight <= local {
+		return
+	}
+	// Fetch the peer's chain backward from its tip to the first block we know.
+	var fetched []Block
+	h := remoteTip
+	for i := 0; i <= remoteHeight+1; i++ {
+		n.mu.Lock()
+		known := n.hasBlockLocked(h)
+		n.mu.Unlock()
+		if known {
+			break // reached the common ancestor
+		}
+		br, err := rpcCallBlock(peer, "getblock", []interface{}{h})
+		if err != nil {
+			log.Printf("[NET] sync: %s getblock(%s) failed: %v", peer, h, err)
+			break
+		}
+		fetched = append(fetched, br)
+		if br.Header.Height == 0 {
+			break // reached genesis
+		}
+		h = br.Header.PrevHash
+	}
+	// Apply oldest-first so each block's parent is already known.
+	for j := len(fetched) - 1; j >= 0; j-- {
+		n.mu.Lock()
+		err := n.acceptBlockLocked(fetched[j])
+		if err == nil {
+			err = n.Save()
+		}
+		n.mu.Unlock()
+		if err != nil {
+			log.Printf("[NET] sync: %s block %s rejected: %v", peer, fetched[j].Hash, err)
+			break
+		}
 	}
 }
-func (n *Node) broadcastBlock(b Block) {
+
+func (n *Node) broadcastCheckpoint(cp Checkpoint) {
 	for _, p := range n.Peers {
-		_, _ = rpcPost(p, "submitblock", []interface{}{b})
+		_, _ = rpcPost(p, "submitcheckpoint", []interface{}{cp})
 	}
 }
 
@@ -850,14 +1208,21 @@ func rpcCallMap(peer, method string, params []interface{}) (map[string]interface
 	var m map[string]interface{}
 	return m, json.Unmarshal(raw, &m)
 }
-func rpcCallString(peer, method string, params []interface{}) (string, error) {
-	raw, err := rpcPost(peer, method, params)
+// rpcGetCheckpoint pulls a peer's current checkpoint, if it has one.
+func rpcGetCheckpoint(peer string) (Checkpoint, bool) {
+	raw, err := rpcPost(peer, "getcheckpoint", []interface{}{})
 	if err != nil {
-		return "", err
+		return Checkpoint{}, false
 	}
-	var s string
-	return s, json.Unmarshal(raw, &s)
+	var resp struct {
+		Checkpoint *Checkpoint `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil || resp.Checkpoint == nil {
+		return Checkpoint{}, false
+	}
+	return *resp.Checkpoint, true
 }
+
 func rpcCallBlock(peer, method string, params []interface{}) (Block, error) {
 	raw, err := rpcPost(peer, method, params)
 	if err != nil {
@@ -893,12 +1258,6 @@ func (n *Node) RPCHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "405 Method Not Allowed: /rpc requires POST", http.StatusMethodNotAllowed)
 		return
 	}
-	// /rpc requires authentication. /explorer and / stay public (read-only).
-	if !n.checkRPCAuth(r) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="toycoind"`)
-		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
-		return
-	}
 	// Cap the request body so a client cannot stream an arbitrarily large JSON
 	// blob to exhaust memory. The decoder will error past the limit.
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRPCBodyBytes)
@@ -910,8 +1269,45 @@ func (n *Node) RPCHandler(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, nil, err)
 		return
 	}
+	// Peer sync and the block explorer need to read chain data and push
+	// fully-validated blocks/txs/checkpoints without holding this node's private
+	// cookie, so those methods are public. Everything that touches wallets, keys
+	// or node config still requires cookie auth (and dumpprivkey stays loopback).
+	if !isPublicRPCMethod(req.Method) && !n.checkRPCAuth(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="toycoind"`)
+		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	res, err := n.handleRPC(req.Method, req.Params, isLoopback(r.RemoteAddr))
 	writeRPC(w, res, err)
+}
+
+// publicRPCMethods are callable without cookie authentication. They are either
+// read-only chain queries (the same data the /explorer page already exposes) or
+// consensus-propagation calls whose inputs are fully validated (submitblock,
+// submittransaction) or signature-gated (submitcheckpoint). Wallet and key
+// operations are deliberately absent and remain authenticated.
+var publicRPCMethods = map[string]bool{
+	"getblockchaininfo": true,
+	"getnetworkinfo":    true,
+	"getpeerinfo":       true,
+	"getblockcount":     true,
+	"getbestblockhash":  true,
+	"getblockhash":      true,
+	"getblock":          true,
+	"getrawmempool":     true,
+	"getcheckpoint":     true,
+	"gettx":             true,
+	"curveinfo":         true,
+	"validateaddress":   true,
+	"submitblock":       true,
+	"submittransaction": true,
+	"submitcheckpoint":  true,
+	"inv":               true,
+}
+
+func isPublicRPCMethod(method string) bool {
+	return publicRPCMethods[strings.ToLower(strings.TrimSpace(method))]
 }
 
 func writeRPC(w http.ResponseWriter, result interface{}, err error) {
@@ -973,6 +1369,20 @@ func paramBlock(params []json.RawMessage, i int) (Block, error) {
 	}
 	var b Block
 	return b, json.Unmarshal(params[i], &b)
+}
+func paramCheckpoint(params []json.RawMessage, i int) (Checkpoint, error) {
+	if len(params) <= i {
+		return Checkpoint{}, errors.New("missing parameter")
+	}
+	var cp Checkpoint
+	return cp, json.Unmarshal(params[i], &cp)
+}
+func paramInvItems(params []json.RawMessage, i int) ([]InvItem, error) {
+	if len(params) <= i {
+		return nil, errors.New("missing parameter")
+	}
+	var items []InvItem
+	return items, json.Unmarshal(params[i], &items)
 }
 
 func (n *Node) handleRPC(method string, params []json.RawMessage, loopback bool) (interface{}, error) {
@@ -1090,6 +1500,40 @@ func (n *Node) handleRPC(method string, params []json.RawMessage, loopback bool)
 			return nil, err
 		}
 		return "accepted", n.SubmitTx(tx)
+	case "submitcheckpoint":
+		cp, err := paramCheckpoint(params, 0)
+		if err != nil {
+			return nil, err
+		}
+		return "accepted", n.SubmitCheckpoint(cp)
+	case "inv":
+		// inv(from, items): a peer announces inventory. from may be "" if the
+		// announcer is not reachable for pulls. Handle asynchronously so the
+		// announcer's HTTP call returns promptly (getdata happens in the
+		// background), mirroring Bitcoin's inv/getdata split.
+		from, _ := paramString(params, 0)
+		items, err := paramInvItems(params, 1)
+		if err != nil {
+			return nil, err
+		}
+		go n.HandleInv(from, items)
+		return "ok", nil
+	case "gettx":
+		txid, err := paramString(params, 0)
+		if err != nil {
+			return nil, err
+		}
+		if tx, ok := n.txByHash(txid); ok {
+			return tx, nil
+		}
+		return nil, errors.New("tx not found in mempool")
+	case "getcheckpoint":
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.State.Checkpoint == nil {
+			return map[string]interface{}{"checkpoint": nil, "authority_configured": n.AuthorityPubKey != ""}, nil
+		}
+		return map[string]interface{}{"checkpoint": n.State.Checkpoint, "authority_configured": n.AuthorityPubKey != ""}, nil
 	case "security.walletreport", "security walletreport", "walletreport":
 		return n.WalletReport(), nil
 	case "curveinfo":

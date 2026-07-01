@@ -98,14 +98,22 @@ type Wallet struct {
 }
 
 type State struct {
-	Network      string                 `json:"network"`
-	Blocks       []Block                `json:"blocks"`
+	Network string  `json:"network"`
+	Blocks  []Block `json:"blocks"` // the active (most-work) chain, genesis first
+	// Index holds every block we have ever validated, keyed by hash, including
+	// blocks on side branches that are not part of the active chain. Fork choice
+	// walks this index to find the most-work chain and reorg onto it.
+	Index        map[string]Block       `json:"block_index"`
 	UTXO         map[string]UTXO        `json:"utxo"`
 	Mempool      []Transaction          `json:"mempool"`
 	Wallets      map[string]*Wallet     `json:"wallets"`
 	ActiveWallet string                 `json:"active_wallet"`
 	Peers        []string               `json:"peers"`
 	Meta         map[string]interface{} `json:"meta"`
+	// Checkpoint, if set, is the highest authority-signed checkpoint this node
+	// has accepted. Fork choice will only follow chains that contain the
+	// checkpointed block at the checkpointed height.
+	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 }
 
 func NewState() (*State, error) {
@@ -116,6 +124,7 @@ func NewState() (*State, error) {
 	return &State{
 		Network: NetworkName,
 		Blocks:  []Block{g},
+		Index:   map[string]Block{g.Hash: g},
 		UTXO:    map[string]UTXO{},
 		Mempool: []Transaction{},
 		Wallets: map[string]*Wallet{},
